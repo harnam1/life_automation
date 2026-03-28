@@ -1,0 +1,28 @@
+name: Weekend Curator
+
+on:
+  schedule:
+    # Every Saturday at 18:00 UTC (19:00 BST / 18:00 GMT)
+    - cron: "0 18 * * 6"
+  workflow_dispatch: # allow manual runs
+
+jobs:
+  curate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r weekend_curator/requirements.txt
+
+      - name: Run Weekend Curator
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+        run: python weekend_curator/weekend_curator.py
