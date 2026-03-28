@@ -140,7 +140,8 @@ def send_email(html_content: str, fri: str, sun: str):
     """Send the curated email via Gmail SMTP."""
     sender = os.environ["GMAIL_ADDRESS"]
     password = os.environ["GMAIL_APP_PASSWORD"]
-    recipients = os.environ.get("RECIPIENT_EMAILS", sender).split(",")
+    recipient_str = os.environ.get("RECIPIENT_EMAILS", "").strip()
+    recipients = [r.strip() for r in recipient_str.split(",")] if recipient_str else [sender]
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"Your London Weekend — {fri} to {sun}"
