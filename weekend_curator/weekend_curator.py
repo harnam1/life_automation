@@ -7,6 +7,7 @@ Runs every Saturday evening via GitHub Actions.
 import os
 import json
 import smtplib
+import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -68,6 +69,13 @@ def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # 
     except json.JSONDecodeError:
         pass
 
+    # Wait for the rate-limit window to reset before retrying
+    print("JSON parse failed — waiting 65s for rate limit window to reset before retry...")
+    time.sleep(65)
+
+    # Truncate raw to ~8000 chars to keep input tokens well within limits
+    raw_truncated = raw[:8000] if len(raw) > 8000 else raw
+
     # Retry: ask Claude to fix its own JSON (minimal prompt to avoid token limits)
     fix_response = CLIENT.messages.create(
         model=MODEL,
@@ -78,7 +86,7 @@ def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # 
                 "content": (
                     "The following text should be a JSON array but is not valid JSON. "
                     "Fix it and return ONLY the JSON array — no markdown, no preamble, no backticks.\n\n"
-                    f"{raw}"
+                    f"{raw_truncated}"
                 ),
             },
         ],
@@ -456,6 +464,10 @@ def main():
     candidates = discover_events(fri, sat, sun)
     print(f"Found {len(candidates)} candidates")
 
+    # Wait for rate-limit window to reset between heavy web-search passes
+    print("Waiting 65s between passes to avoid rate limits...")
+    time.sleep(65)
+
     # Pass 2: Verify + Rewrite
     print("Pass 2: Verifying dates and rewriting...")
     verified = verify_and_rewrite(candidates, fri, sat, sun)
@@ -468,6 +480,7 @@ def main():
     # Backfill if needed
     if len(confirmed) < 12:
         print(f"Backfilling: need {12 - len(confirmed)} more events...")
+        time.sleep(65)
         confirmed = backfill(confirmed, fri, sat, sun)
 
     # Edge case: everything failed
