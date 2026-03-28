@@ -6,6 +6,7 @@ Runs every Saturday evening via GitHub Actions.
 
 import os
 import json
+import re
 import smtplib
 import time
 from email.mime.multipart import MIMEMultipart
@@ -55,18 +56,42 @@ def _extract_text(response) -> str:
 
 
 def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # noqa: ARG001
-    """Strip markdown fencing and parse JSON. Retry once with a fix prompt if needed."""
-    def clean(text: str) -> str:
+    """Extract and parse a JSON array from Claude's response.
+
+    Handles: raw JSON, markdown-fenced JSON, preamble text before the array.
+    Retries once (after a rate-limit cooldown) if extraction fails.
+    """
+    def extract_json_array(text: str) -> list[dict]:
+        """Find the first [...] array in text, regardless of surrounding content."""
+        # Try direct parse first (clean JSON with no wrapper)
         text = text.strip()
-        if text.startswith("```"):
-            text = text[text.index("\n") + 1:] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[: text.rfind("```")]
-        return text.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Strip a single markdown code fence if present (```json ... ``` or ``` ... ```)
+        fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+        if fenced:
+            return json.loads(fenced.group(1))
+
+        # Extract the first top-level JSON array using bracket matching
+        start = text.find("[")
+        if start == -1:
+            raise ValueError("No JSON array found in response")
+        depth = 0
+        for i, ch in enumerate(text[start:], start):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[start : i + 1])
+        raise ValueError("Unterminated JSON array in response")
 
     try:
-        return json.loads(clean(raw))
-    except json.JSONDecodeError:
+        return extract_json_array(raw)
+    except (json.JSONDecodeError, ValueError):
         pass
 
     # Wait for the rate-limit window to reset before retrying
@@ -92,7 +117,7 @@ def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # 
         ],
     )
     fixed = _extract_text(fix_response)
-    return json.loads(clean(fixed))
+    return extract_json_array(fixed)
 
 
 # ---------------------------------------------------------------------------
