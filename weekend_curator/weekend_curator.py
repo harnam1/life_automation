@@ -55,6 +55,19 @@ def _extract_text(response) -> str:
     return "\n".join(block.text for block in response.content if block.type == "text")
 
 
+def _create_message(**kwargs):
+    """Wrapper around CLIENT.messages.create with automatic 429 retry (up to 3 attempts)."""
+    for attempt in range(3):
+        try:
+            return CLIENT.messages.create(**kwargs)
+        except anthropic.RateLimitError:
+            if attempt == 2:
+                raise
+            wait = 65 * (attempt + 1)
+            print(f"Rate limit hit — waiting {wait}s before retry (attempt {attempt + 1}/3)...")
+            time.sleep(wait)
+
+
 def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # noqa: ARG001
     """Extract and parse a JSON array from Claude's response.
 
@@ -102,7 +115,7 @@ def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # 
     raw_truncated = raw[:8000] if len(raw) > 8000 else raw
 
     # Retry: ask Claude to fix its own JSON (minimal prompt to avoid token limits)
-    fix_response = CLIENT.messages.create(
+    fix_response = _create_message(
         model=MODEL,
         max_tokens=4096,
         messages=[
@@ -183,7 +196,7 @@ Return ONLY a JSON array in this exact format. No markdown, no preamble, no back
 ]
 """
 
-    response = CLIENT.messages.create(
+    response = _create_message(
         model=MODEL,
         max_tokens=4096,
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
@@ -289,7 +302,7 @@ but leave other fields as-is.
 Return ONLY the JSON array. No markdown, no preamble, no backticks.
 """
 
-    response = CLIENT.messages.create(
+    response = _create_message(
         model=MODEL,
         max_tokens=4096,
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 15}],
@@ -422,7 +435,7 @@ Requirements:
 - Do NOT include <html>, <head>, or <body> tags — just the inner content
 - Return ONLY the HTML. No markdown, no preamble, no backticks.
 """
-        response = CLIENT.messages.create(
+        response = _create_message(
             model=MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
@@ -519,7 +532,9 @@ def main():
     print("Pass 3: Validating links...")
     validated = validate_links(confirmed)
 
-    # Format and send
+    # Format and send (wait for rate-limit window before the formatting call)
+    print("Waiting 65s before formatting to avoid rate limits...")
+    time.sleep(65)
     print("Formatting email...")
     html = format_email(validated, fri, sun)
     send_email(html, fri, sun)
