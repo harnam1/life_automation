@@ -98,8 +98,11 @@ def extract_html(response_text: str) -> str:
     """Extract HTML content from Claude's response, handling markdown code blocks."""
     if "```html" in response_text:
         start = response_text.index("```html") + 7
-        end = response_text.index("```", start)
-        return response_text[start:end].strip()
+        try:
+            end = response_text.index("```", start)
+            return response_text[start:end].strip()
+        except ValueError:
+            return response_text[start:].strip()
     if response_text.strip().startswith("<"):
         return response_text.strip()
     return f"<div>{response_text}</div>"
