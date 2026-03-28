@@ -53,7 +53,7 @@ def _extract_text(response) -> str:
     return "\n".join(block.text for block in response.content if block.type == "text")
 
 
-def _parse_json_response(raw: str, original_prompt: str) -> list[dict]:
+def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # noqa: ARG001
     """Strip markdown fencing and parse JSON. Retry once with a fix prompt if needed."""
     def clean(text: str) -> str:
         text = text.strip()
@@ -68,18 +68,17 @@ def _parse_json_response(raw: str, original_prompt: str) -> list[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Retry: ask Claude to fix its own JSON
+    # Retry: ask Claude to fix its own JSON (minimal prompt to avoid token limits)
     fix_response = CLIENT.messages.create(
         model=MODEL,
         max_tokens=4096,
         messages=[
-            {"role": "user", "content": original_prompt},
-            {"role": "assistant", "content": raw},
             {
                 "role": "user",
                 "content": (
-                    "Your response was not valid JSON. Fix it and return ONLY "
-                    "the JSON array — no markdown, no preamble, no backticks."
+                    "The following text should be a JSON array but is not valid JSON. "
+                    "Fix it and return ONLY the JSON array — no markdown, no preamble, no backticks.\n\n"
+                    f"{raw}"
                 ),
             },
         ],
