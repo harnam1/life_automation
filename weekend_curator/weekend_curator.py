@@ -1,7 +1,15 @@
 """
-London Weekend Curator — v2
+London Weekend Curator — v3
 Three-pass pipeline: Discovery → Verify+Rewrite → Link Validation → Send
 Runs every Saturday evening via GitHub Actions.
+
+Changes from v2:
+- Dropped SPORTS category entirely
+- Restructured categories: FOOD, CULTURE, NEW_OPENINGS, WEIRD, FREEBIES
+- Overhauled source list — banned mainstream aggregators, prioritised niche
+- Tighter prompts to reduce token waste
+- Verify+rewrite prompt personalised and sharpened
+- Token usage logging added
 """
 
 import os
@@ -21,6 +29,9 @@ import requests
 
 CLIENT = anthropic.Anthropic()
 MODEL = "claude-haiku-4-5-20251001"
+
+# Track token usage across all API calls
+USAGE_LOG: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -55,40 +66,59 @@ def _extract_text(response) -> str:
     return "\n".join(block.text for block in response.content if block.type == "text")
 
 
-def _create_message(**kwargs):
-    """Wrapper around CLIENT.messages.create with automatic 429 retry (up to 3 attempts)."""
+def _log_usage(label: str, response):
+    """Log token usage from an API response."""
+    usage = response.usage
+    web_searches = getattr(usage, "server_tool_use", None)
+    search_count = 0
+    if web_searches and hasattr(web_searches, "web_search_requests"):
+        search_count = web_searches.web_search_requests
+
+    entry = {
+        "step": label,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        "web_searches": search_count,
+    }
+    USAGE_LOG.append(entry)
+
+    total_in = entry["input_tokens"] + entry["cache_read"] + entry["cache_write"]
+    print(
+        f"  [{label}] in={total_in:,} out={entry['output_tokens']:,} "
+        f"searches={search_count}"
+    )
+
+
+def _create_message(label: str = "unknown", **kwargs):
+    """Wrapper with retry, rate-limit handling, and usage logging."""
     for attempt in range(3):
         try:
-            return CLIENT.messages.create(**kwargs)
+            response = CLIENT.messages.create(**kwargs)
+            _log_usage(label, response)
+            return response
         except anthropic.RateLimitError:
             if attempt == 2:
                 raise
             wait = 65 * (attempt + 1)
-            print(f"Rate limit hit — waiting {wait}s before retry (attempt {attempt + 1}/3)...")
+            print(f"Rate limit hit — waiting {wait}s (attempt {attempt + 1}/3)...")
             time.sleep(wait)
 
 
-def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # noqa: ARG001
-    """Extract and parse a JSON array from Claude's response.
-
-    Handles: raw JSON, markdown-fenced JSON, preamble text before the array.
-    Retries once (after a rate-limit cooldown) if extraction fails.
-    """
+def _parse_json_response(raw: str) -> list[dict]:
+    """Extract and parse a JSON array from Claude's response."""
     def extract_json_array(text: str) -> list[dict]:
-        """Find the first [...] array in text, regardless of surrounding content."""
-        # Try direct parse first (clean JSON with no wrapper)
         text = text.strip()
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Strip a single markdown code fence if present (```json ... ``` or ``` ... ```)
         fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
         if fenced:
             return json.loads(fenced.group(1))
 
-        # Extract the first top-level JSON array using bracket matching
         start = text.find("[")
         if start == -1:
             raise ValueError("No JSON array found in response")
@@ -107,23 +137,19 @@ def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # 
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Wait for the rate-limit window to reset before retrying
-    print("JSON parse failed — waiting 65s for rate limit window to reset before retry...")
+    print("JSON parse failed — waiting 65s before retry...")
     time.sleep(65)
 
-    # Truncate raw to ~8000 chars to keep input tokens well within limits
     raw_truncated = raw[:8000] if len(raw) > 8000 else raw
-
-    # Retry: ask Claude to fix its own JSON (minimal prompt to avoid token limits)
     fix_response = _create_message(
+        label="json_fix",
         model=MODEL,
         max_tokens=4096,
         messages=[
             {
                 "role": "user",
                 "content": (
-                    "The following text should be a JSON array but is not valid JSON. "
-                    "Fix it and return ONLY the JSON array — no markdown, no preamble, no backticks.\n\n"
+                    "Fix this into a valid JSON array. Return ONLY the array, nothing else.\n\n"
                     f"{raw_truncated}"
                 ),
             },
@@ -137,179 +163,145 @@ def _parse_json_response(raw: str, original_prompt: str = "") -> list[dict]:  # 
 # Pass 1: Discovery
 # ---------------------------------------------------------------------------
 
-def discover_events(fri: str, sat: str, sun: str, extra_instruction: str = "") -> list[dict]:
-    """Call Claude with web search to find candidate events. Returns raw JSON list."""
-    prompt = f"""You are a London weekend curator for someone who lives in Canary Wharf.
+DISCOVERY_PROMPT = """Find 15 things to do in London on {fri}, {sat}, and {sun}.
 
-Find exactly 15 things to do in London for the weekend of {fri} to {sun}.
+You are writing for a 23-year-old Canary Wharf resident who has lived in London
+for years. He does NOT want: tourist attractions, "best of London" listicle
+staples, overpriced "experience" packages, anything designed for Instagram
+influencers, or generic chain restaurant recommendations. He wants things a
+well-connected local would know about.
 
-The selections MUST cover these categories (aim for roughly 3 each):
+Categories — find roughly 3-4 per category:
 
-- SPORTS: Live sports events, pick-up games, interesting fitness events, spectator sport
-- FOOD: New restaurant openings, pop-ups, food markets, supper clubs, notable dining
-- CULTURE: Exhibitions, theatre, gigs, comedy, film, talks, literary events
-- NEW_OPENINGS: Bars, venues, shops, spaces that recently opened or are launching that weekend
-- WEIRD: Unusual, quirky, surprising, niche, or one-off events — the stranger the better
+FOOD: Pop-up kitchens, supper clubs, new restaurant soft launches, street food
+      collabs, tasting menus under £50, market stalls worth queuing for, wine
+      bars doing interesting by-the-glass lists, brewery taproom events. NOT
+      established restaurants just being open as normal.
+
+CULTURE: Gallery openings/private views, new exhibitions launching that week,
+         fringe theatre, comedy clubs (not West End), independent cinema
+         screenings, book launches, gigs at small venues (<500 cap), DJ nights
+         at interesting spaces, spoken word, poetry slams, talks/panels.
+
+NEW_OPENINGS: Anything that opened in the last 4 weeks OR is launching this
+              weekend. Bars, restaurants, shops, co-working spaces, studios,
+              markets. The newer the better.
+
+WEIRD: One-off events, niche meetups, unusual workshops, late-night museum
+       events, immersive stuff that isn't mainstream, supper clubs in strange
+       locations, guerrilla cinema, foraging walks, competitive events
+       (chess, ping pong tournaments, pub quizzes with a twist). Things you'd
+       screenshot and send to a group chat.
+
+FREEBIES: Free exhibitions, open studios, free gigs, free comedy nights,
+          gallery openings with free drinks, community events, outdoor
+          screenings, free workshops, brand launch parties that are actually
+          open to public. London residents shouldn't have to pay for everything.
 
 {extra_instruction}
 
-Prioritise niche and specialist sources over generic listings aggregators.
-Preferred sources by category:
+SOURCE RULES — this is critical:
 
-SPORTS: London Sport, TimeOut Sport, club/venue sites directly, parkrun pages,
-        British Tennis, England Athletics, London Marathon Events, community
-        league sites, MeetUp groups
+MUST USE these sources (search them directly):
+- Eater London (eater.com/london) — new openings, pop-ups, restaurant news
+- Hot Dinners (hot-dinners.com) — London restaurant openings and pop-ups
+- Infatuation London — honest restaurant reviews
+- Resident Advisor (ra.co) — music, club nights, DJ events
+- Dice.fm — gigs, comedy, cultural events with actual dates
+- Dazed, i-D, Another Magazine — culture picks
+- Londonist (londonist.com) — weird London, offbeat events
+- Design My Night — bar openings, event listings with dates
+- Skiddle — gigs and club nights
+- Venue sites directly: Barbican, Southbank, ICA, Serpentine, Whitechapel
+  Gallery, Corsica Studios, Village Underground, Omeara, EartH
 
-FOOD: Eater London, Hot Dinners, Infatuation London, London Eater Instagram
-      accounts, individual restaurant Instagram/sites, Feast It, KERB,
-      Street Feast, Maltby Street Market site, Borough Market calendar
+NEVER USE these sources:
+- Time Out London (timeout.com) — generic, obvious, SEO-optimised
+- TripAdvisor — tourist-oriented
+- Yelp — irrelevant for events
+- Viator / GetYourGuide — tourist experiences
+- Generic "top 10 things to do" blog posts
+- London Theatre Direct or similar for West End shows
 
-CULTURE: Artsy, Frieze, Barbican/Southbank/BFI/ICA calendars directly,
-         Resident Advisor (music), Dice.fm, Songkick, Dazed, Another Magazine,
-         London Review of Books events, Serpentine site, White Cube/Gagosian
-         sites, Curzon/Prince Charles Cinema listings
+If you find yourself recommending the Tower of London, a West End musical,
+afternoon tea, or a Thames river cruise, you have failed the assignment.
 
-NEW_OPENINGS: Eater London openings tracker, Hot Dinners, Costar/proptech
-              press releases, individual venue Instagram announcements,
-              Evening Standard Going Out, Wallpaper* city guide
-
-WEIRD: Atlas Obscura London, Londonist, Niche London (newsletter), Reddit
-       r/london, Obscura Magazine, Museum of the Mind events, Viktor Wynd
-       Museum, London Fortean Society, unusual meetup groups
-
-Avoid relying heavily on: Time Out "best of" listicles, generic Eventbrite
-browse pages, TripAdvisor, Yelp, or SEO-optimised "top 10" blog posts.
-These produce generic, obvious recommendations.
-
-Return ONLY a JSON array in this exact format. No markdown, no preamble, no backticks:
-
-[
-  {{
-    "name": "Event Name",
-    "category": "SPORTS",
-    "dates": ["Friday 4 April 2025"],
-    "location": "Peckham",
-    "description": "Why it's worth going — 1-2 sentences",
-    "url": "https://...",
-    "price": "£15"
-  }}
-]
+Return ONLY a JSON array, no markdown, no preamble:
+[{{"name":"...","category":"FOOD|CULTURE|NEW_OPENINGS|WEIRD|FREEBIES","dates":["..."],"location":"...","description":"...","url":"...","price":"..."}}]
 """
 
+
+def discover_events(fri: str, sat: str, sun: str, extra_instruction: str = "") -> list[dict]:
+    prompt = DISCOVERY_PROMPT.format(
+        fri=fri, sat=sat, sun=sun,
+        extra_instruction=extra_instruction,
+    )
     response = _create_message(
+        label="discovery",
         model=MODEL,
         max_tokens=4096,
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 10}],
         messages=[{"role": "user", "content": prompt}],
     )
     raw = _extract_text(response)
-    return _parse_json_response(raw, prompt)
+    return _parse_json_response(raw)
 
 
 # ---------------------------------------------------------------------------
 # Pass 2: Verify + Rewrite
 # ---------------------------------------------------------------------------
 
-def verify_and_rewrite(candidates: list[dict], fri: str, sat: str, sun: str) -> list[dict]:
-    """Second Claude call: fact-check dates, rewrite copy, improve links."""
-    candidates_json = json.dumps(candidates, indent=2)
-    n = len(candidates)
-
-    prompt = f"""You are a fact-checker and rewriter for a London weekend newsletter aimed at
-a 23-year-old guy living in Canary Wharf. He's into powerlifting, tennis,
-squash, Bhangra, good food (not fine dining wank), contemporary art, live
-music, comedy, and anything genuinely strange or one-off. He's not interested
-in generic tourist stuff, overpriced "experiences", or anything that feels
-like it was designed for Instagram influencers. He goes out with his
-girlfriend and with mates — so both date-worthy and group-friendly picks
-are good.
-
-You have {n} candidate events for the weekend of {fri} to {sun}.
+VERIFY_PROMPT = """You have {n} candidate London events for {fri} to {sun}.
 
 {candidates_json}
 
-For EACH event, do the following:
+For EACH event do three things:
 
-## Step 1: Date Verification
+1. DATE CHECK — search to confirm it's genuinely on {fri}, {sat}, or {sun}.
+   - CONFIRMED: found direct evidence (event page, ticket link, venue calendar)
+   - ONGOING: permanent/long-running thing currently open (exhibition, restaurant)
+   - FAILED: already happened, wrong weekend, cancelled, no evidence it exists
 
-Search for the event to confirm it is genuinely happening on one of the
-target dates.
+2. REWRITE — for non-FAILED events, completely rewrite the description:
+   - You're texting a mate, not writing listings copy
+   - Be specific: "their smash burgers are up there with Buns From Home and
+     they pour natural wine" NOT "a new burger restaurant with a great wine list"
+   - Include practical tips: "book ahead, it's tiny" / "walk-ins only, go before 6"
+   - Mention travel from Canary Wharf where useful: "10 mins on the Jubilee line"
+   - 2 sentences max. No fluff.
+   - BANNED WORDS: hidden gem, vibrant, bustling, iconic, unmissable, curated,
+     artisanal, bespoke, eclectic, up-and-coming, trendy, must-visit, foodie
 
-Classify as:
-- CONFIRMED: Direct evidence (event page, ticket listing, venue calendar)
-  confirming the event falls on {fri}, {sat}, or {sun}
-- ONGOING: Permanent or long-running attraction (exhibition, restaurant,
-  bar) that is currently open — no specific date needed
-- FAILED: Event already happened, is on a different weekend, has been
-  cancelled, venue has closed, recurring series has ended, or you cannot
-  find any evidence it exists
+3. LINK UPGRADE — if the URL points to timeout.com, a generic eventbrite browse
+   page, tripadvisor, or any aggregator homepage, replace it with:
+   - The venue's own event page or booking link
+   - A direct Dice.fm / FIXR / Eventbrite EVENT page (not browse)
+   - The venue/event Instagram post
+   - An Eater London or Hot Dinners article about it
 
-If FAILED, briefly note why and move on. Do not attempt to salvage it.
+Return JSON array with ALL events (including FAILED):
+[{{"name":"...","category":"...","status":"CONFIRMED|ONGOING|FAILED","dates":["..."],"location":"...","description":"...","url":"...","price":"...","verification_note":"..."}}]
 
-## Step 2: Rewrite the Description
-
-For events that pass verification, rewrite the description completely.
-Rules:
-- Write like a mate recommending something over a pint, not a listings
-  magazine. First person observations, casual language, occasional swearing
-  is fine.
-- Be specific about WHY it's good — don't just describe what it is.
-  "Their carbonara is filthy good and they do half-price negronis before 7"
-  beats "An Italian restaurant offering classic dishes."
-- If you know something non-obvious (e.g. "get there early, it's first
-  come first served" or "the support act is actually better than the
-  headliner"), include it.
-- Keep it to 2-3 sentences max.
-- Never use: "hidden gem", "vibrant", "bustling", "iconic", "unmissable",
-  "curated", "artisanal", "bespoke". These words are banned.
-- Reference the person's proximity to Canary Wharf where useful (e.g.
-  "15 mins on the Jubilee line" or "walkable from yours").
-
-## Step 3: Find the Best Link
-
-If the original URL is a generic aggregator page (e.g. timeout.com/london,
-eventbrite.co.uk browse page, tripadvisor listing), replace it with a more
-direct source:
-- The venue's own website or event page
-- A direct ticket purchase link (Dice, FIXR, Eventbrite event page)
-- The venue/event's Instagram post announcing it
-- A specific article from a niche source (Eater London, Hot Dinners, RA)
-
-The ideal link is one where the reader lands and can immediately see what
-the event is + how to go/book. Not a homepage. Not a search results page.
-
-## Output
-
-Return a JSON array of ALL events (including FAILED ones):
-
-[
-  {{
-    "name": "Event Name",
-    "category": "SPORTS",
-    "status": "CONFIRMED",
-    "dates": ["Saturday 5 April 2025"],
-    "location": "Peckham",
-    "description": "Rewritten description in the voice described above",
-    "url": "https://direct-link.com/event",
-    "price": "£15",
-    "verification_note": "Found on venue calendar, tickets on Dice"
-  }}
-]
-
-Include FAILED events with status "FAILED" and a brief verification_note,
-but leave other fields as-is.
-
-Return ONLY the JSON array. No markdown, no preamble, no backticks.
+ONLY the JSON array. No markdown, no preamble.
 """
 
+
+def verify_and_rewrite(candidates: list[dict], fri: str, sat: str, sun: str) -> list[dict]:
+    candidates_json = json.dumps(candidates, indent=2)
+    prompt = VERIFY_PROMPT.format(
+        n=len(candidates),
+        fri=fri, sat=sat, sun=sun,
+        candidates_json=candidates_json,
+    )
     response = _create_message(
+        label="verify_rewrite",
         model=MODEL,
         max_tokens=4096,
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 15}],
         messages=[{"role": "user", "content": prompt}],
     )
     raw = _extract_text(response)
-    return _parse_json_response(raw, prompt)
+    return _parse_json_response(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -317,12 +309,11 @@ Return ONLY the JSON array. No markdown, no preamble, no backticks.
 # ---------------------------------------------------------------------------
 
 def backfill(confirmed: list[dict], fri: str, sat: str, sun: str) -> list[dict]:
-    """Top up to 12 events if verification dropped too many."""
     needed = 12 - len(confirmed)
     if needed <= 0:
         return confirmed
 
-    all_cats = ["SPORTS", "FOOD", "CULTURE", "NEW_OPENINGS", "WEIRD"]
+    all_cats = ["FOOD", "CULTURE", "NEW_OPENINGS", "WEIRD", "FREEBIES"]
     category_counts: dict[str, int] = {}
     for e in confirmed:
         cat = e.get("category", "UNKNOWN")
@@ -331,19 +322,20 @@ def backfill(confirmed: list[dict], fri: str, sat: str, sun: str) -> list[dict]:
     gaps = []
     for cat in all_cats:
         have = category_counts.get(cat, 0)
-        if have < 3:
-            gaps.append(f"{3 - have} more {cat}")
+        if have < 2:
+            gaps.append(f"{2 - have} more {cat}")
 
     gap_desc = ", ".join(gaps) if gaps else f"{needed} events across any category"
     existing_names = ", ".join(e["name"] for e in confirmed)
     extra = (
-        f"I need {gap_desc} for the weekend of {fri} to {sun}. "
-        f"Use date-specific search queries like 'london {fri}' to find real events. "
-        f"Do NOT suggest events already in this list: {existing_names}"
+        f"I need {gap_desc} for {fri} to {sun}. "
+        f"Use date-specific queries like 'london events {fri}'. "
+        f"Do NOT repeat: {existing_names}"
     )
 
     print(f"  Backfill: requesting {needed} events ({gap_desc})")
     new_candidates = discover_events(fri, sat, sun, extra_instruction=extra)
+    time.sleep(65)
     new_verified = verify_and_rewrite(new_candidates, fri, sat, sun)
     new_confirmed = [e for e in new_verified if e.get("status") in ("CONFIRMED", "ONGOING")]
 
@@ -362,7 +354,7 @@ def _google_fallback(event_name: str) -> str:
 
 
 def validate_links(events: list[dict]) -> list[dict]:
-    """HTTP HEAD check every URL; replace broken links with Google search fallback."""
+    """HTTP HEAD check every URL; replace broken links with Google fallback."""
 
     def check_url(event: dict) -> dict:
         url = event.get("url", "").strip()
@@ -377,13 +369,12 @@ def validate_links(events: list[dict]) -> list[dict]:
             if resp.status_code < 400:
                 event["link_status"] = "OK"
                 return event
-            # HEAD rejected — try GET without downloading body
             resp = requests.get(url, timeout=10, allow_redirects=True, headers=headers, stream=True)
             if resp.status_code < 400:
                 event["link_status"] = "OK"
             else:
                 event["url"] = _google_fallback(event["name"])
-                event["link_status"] = f"REPLACED (was {resp.status_code})"
+                event["link_status"] = f"REPLACED ({resp.status_code})"
         except requests.RequestException:
             event["url"] = _google_fallback(event["name"])
             event["link_status"] = "REPLACED (timeout/error)"
@@ -402,40 +393,41 @@ def validate_links(events: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Format email (Claude formats the verified JSON into HTML)
+# Format email
 # ---------------------------------------------------------------------------
 
+FORMAT_PROMPT = """Format these London weekend events as HTML email content.
+
+Weekend: {fri} to {sun}
+
+{events_json}
+
+Rules:
+- Dark header (#1a1a1a bg, white text) with weekend dates
+- Group by category with headers: 🍴 FOOD, 🎭 CULTURE, 🆕 NEW OPENINGS, 🔮 WEIRD, 🆓 FREEBIES
+- Each event: name (bold), location + date + price on one line, description,
+  clickable "→ More info" link (#2563eb)
+- Inline CSS only, max-width 640px, Gmail-safe
+- No <html>/<head>/<body> tags
+- ONLY return HTML, nothing else
+"""
+
+
 def format_email(events: list[dict], fri: str, sun: str) -> str:
-    """Ask Claude to format the verified events as a styled HTML email body."""
     if not events:
         inner_html = f"""
         <div style="background:#1a1a1a;color:#fff;padding:32px;text-align:center;border-radius:8px;">
             <h1 style="margin:0;">Your London Weekend</h1>
             <p style="color:#aaa;margin:8px 0 0;">{fri} &mdash; {sun}</p>
         </div>
-        <p style="margin-top:32px;">Slim pickings this weekend — couldn't verify enough events in time.
+        <p style="margin-top:32px;">Slim pickings this weekend — couldn't verify enough.
         Check back next Saturday.</p>
         """
     else:
         events_json = json.dumps(events, indent=2)
-        prompt = f"""Format the following verified London weekend events as a clean HTML email body.
-
-Weekend dates: {fri} to {sun}
-
-Events:
-{events_json}
-
-Requirements:
-- Dark header banner (#1a1a1a background, white text) with the weekend dates
-- Group events by category with emoji headers: SPORTS, FOOD, CULTURE, NEW_OPENINGS, WEIRD
-- For each event show: name (bold), location, date(s), price, description, and a
-  clickable "Book / Info →" anchor using the url field (color: #2563eb)
-- Tone: punchy, no waffle
-- Simple inline styles, max-width 640px, renders in Gmail
-- Do NOT include <html>, <head>, or <body> tags — just the inner content
-- Return ONLY the HTML. No markdown, no preamble, no backticks.
-"""
+        prompt = FORMAT_PROMPT.format(fri=fri, sun=sun, events_json=events_json)
         response = _create_message(
+            label="format_email",
             model=MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
@@ -452,10 +444,10 @@ Requirements:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #1a1a1a; max-width: 640px; margin: 0 auto; padding: 20px; background: #f8f8f8;">
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.6;color:#1a1a1a;max-width:640px;margin:0 auto;padding:20px;background:#f8f8f8;">
     {inner_html.strip()}
-    <hr style="border: none; border-top: 1px solid #e5e5e5; margin: 32px 0 16px;">
-    <p style="font-size: 12px; color: #999; text-align: center;">
+    <hr style="border:none;border-top:1px solid #e5e5e5;margin:32px 0 16px;">
+    <p style="font-size:12px;color:#999;text-align:center;">
         Auto-generated by Weekend Curator · Powered by Claude
     </p>
 </body>
@@ -467,7 +459,6 @@ Requirements:
 # ---------------------------------------------------------------------------
 
 def send_email(html_content: str, fri: str, sun: str):
-    """Send the curated email via Gmail SMTP."""
     sender = os.environ["GMAIL_ADDRESS"]
     password = os.environ["GMAIL_APP_PASSWORD"]
     recipient_str = os.environ.get("RECIPIENT_EMAILS", "").strip()
@@ -490,6 +481,48 @@ def send_email(html_content: str, fri: str, sun: str):
 
 
 # ---------------------------------------------------------------------------
+# Usage summary
+# ---------------------------------------------------------------------------
+
+def print_usage_summary():
+    """Print a breakdown of token usage and estimated cost."""
+    print("\n" + "=" * 60)
+    print("TOKEN USAGE SUMMARY")
+    print("=" * 60)
+
+    total_in = 0
+    total_out = 0
+    total_searches = 0
+
+    for entry in USAGE_LOG:
+        step_in = entry["input_tokens"] + entry["cache_read"] + entry["cache_write"]
+        total_in += step_in
+        total_out += entry["output_tokens"]
+        total_searches += entry["web_searches"]
+        print(
+            f"  {entry['step']:20s}  "
+            f"in={step_in:>7,}  out={entry['output_tokens']:>6,}  "
+            f"searches={entry['web_searches']}"
+        )
+
+    # Haiku 4.5 pricing: $1/MTok input, $5/MTok output, $0.01/search
+    cost_in = (total_in / 1_000_000) * 1.0
+    cost_out = (total_out / 1_000_000) * 5.0
+    cost_search = total_searches * 0.01
+    cost_total = cost_in + cost_out + cost_search
+
+    print("-" * 60)
+    print(f"  {'TOTAL':20s}  in={total_in:>7,}  out={total_out:>6,}  searches={total_searches}")
+    print()
+    print(f"  Input tokens:   ${cost_in:.4f}")
+    print(f"  Output tokens:  ${cost_out:.4f}")
+    print(f"  Web searches:   ${cost_search:.2f}")
+    print(f"  TOTAL COST:     ${cost_total:.4f}")
+    print(f"  Monthly (4 runs): ~${cost_total * 4:.2f}")
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -498,16 +531,15 @@ def main():
     print(f"Curating weekend: {fri} — {sun}")
 
     # Pass 1: Discovery
-    print("Pass 1: Discovering events...")
+    print("\nPass 1: Discovering events...")
     candidates = discover_events(fri, sat, sun)
     print(f"Found {len(candidates)} candidates")
 
-    # Wait for rate-limit window to reset between heavy web-search passes
-    print("Waiting 65s between passes to avoid rate limits...")
+    print("Waiting 65s between passes...")
     time.sleep(65)
 
     # Pass 2: Verify + Rewrite
-    print("Pass 2: Verifying dates and rewriting...")
+    print("\nPass 2: Verifying dates and rewriting...")
     verified = verify_and_rewrite(candidates, fri, sat, sun)
     confirmed = [e for e in verified if e.get("status") in ("CONFIRMED", "ONGOING")]
     failed = [e for e in verified if e.get("status") == "FAILED"]
@@ -517,23 +549,24 @@ def main():
 
     # Backfill if needed
     if len(confirmed) < 12:
-        print(f"Backfilling: need {12 - len(confirmed)} more events...")
+        print(f"\nBackfilling: need {12 - len(confirmed)} more events...")
         time.sleep(65)
         confirmed = backfill(confirmed, fri, sat, sun)
 
-    # Edge case: everything failed
+    # Edge case
     if not confirmed:
-        print("All events failed verification — sending apology email")
+        print("All events failed — sending apology email")
         html = format_email([], fri, sun)
         send_email(html, fri, sun)
+        print_usage_summary()
         return
 
     # Pass 3: Link validation
-    print("Pass 3: Validating links...")
+    print("\nPass 3: Validating links...")
     validated = validate_links(confirmed)
 
-    # Format and send (wait for rate-limit window before the formatting call)
-    print("Waiting 65s before formatting to avoid rate limits...")
+    # Format and send
+    print("\nWaiting 65s before formatting...")
     time.sleep(65)
     print("Formatting email...")
     html = format_email(validated, fri, sun)
@@ -544,6 +577,8 @@ def main():
     print(f"  ONGOING:   {sum(1 for e in validated if e.get('status') == 'ONGOING')}")
     link_ok = sum(1 for e in validated if e.get("link_status") == "OK")
     print(f"  Links OK:  {link_ok}/{len(validated)}")
+
+    print_usage_summary()
 
 
 if __name__ == "__main__":
